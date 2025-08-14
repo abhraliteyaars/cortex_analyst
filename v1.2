@@ -1,0 +1,223 @@
+import streamlit as st
+from snowflake.snowpark.context import (
+    get_active_session,
+)
+import _snowflake  # For interacting with Snowflake-specific APIs
+import json  # To handle JSON data
+import time #to add delay in bot response
+import pandas as pd
+import uuid
+
+
+
+# List of available semantic model paths in the format: <DATABASE>.<SCHEMA>.<STAGE>/<FILE-NAME>
+# Each path points to a YAML file defining a semantic model
+AVAILABLE_SEMANTIC_MODELS_PATHS = [
+    "ECOMM_ANALYTICS.ECOMM_KPI_DEV.ECOMM_KPI__SEMANTIC_MODEL"
+]
+API_ENDPOINT = "/api/v2/cortex/analyst/message"
+# FEEDBACK_API_ENDPOINT = "/api/v2/cortex/analyst/feedback"
+API_TIMEOUT = 50000  # in milliseconds
+
+#conversation history
+def conversation_history():
+    # --- NEW: Replay conversation history ---
+    if "messages" not in st.session_state:  # first run
+        st.session_state.messages = []
+        with st.chat_message("assistant"):
+            welcome_message = "Welcome to the Ecomm KPI Analyst bot. Please ask questions on the ecomm kpi table"
+            st.markdown(welcome_message)
+    
+    else:
+        # replay all past messages
+        for idx, msg in enumerate(st.session_state.messages):
+            with st.chat_message("user" if msg["role"] == "user" else "assistant"):
+                for item in msg["content"]:
+                    if item["type"] == "text":
+                        st.markdown(item['text'])
+                        
+                    elif item["type"] =="sql":
+                        query = item["statement"]
+                        st.markdown("You can run this SQL to get your analysis:")
+                        # Display the SQL query
+                        with st.expander("SQL Query", expanded=False):
+                            st.code(query,language = 'sql')
+                        
+                        df = session.sql(query).to_pandas()
+                        data_tab, chart_tab = st.tabs(["Data 📄", "Chart 📉"])
+                        with data_tab:
+                                st.dataframe(df, use_container_width=True)
+    
+                        with chart_tab:
+                            chart_generator(df,idx)
+                            
+                    elif item["type"] =="suggestions":
+                        st.markdown("Here are some suggested queries:")
+                        for suggestion in item["suggestions"]:
+                            st.code(suggestion,language = 'sql')
+                    else:
+                        st.markdown(item)
+                
+
+#user message
+def user_message():
+        new_user_message = {
+        "role": "user",
+        "content": [{"type": "text", "text": prompt}]
+        }
+        st.session_state.messages.append(new_user_message)
+
+        with st.chat_message("user"):
+            for item in new_user_message["content"]:
+                if item["type"] == "text":
+                    st.markdown(item["text"])
+
+def analyst_response(messages):
+        # Prepare the request body with the user's prompt
+        request_body = {
+            "messages": messages,
+            "semantic_view": "ECOMM_ANALYTICS.ECOMM_KPI_DEV.ECOMM_KPI__SEMANTIC_MODEL"
+        }
+        
+        # st.write(request_body)
+        
+        # Send a POST request to the Cortex Analyst API endpoint
+        # Adjusted to use positional arguments as per the API's requirement
+        resp = _snowflake.send_snow_api_request(
+            "POST",  # method
+            API_ENDPOINT,  # path
+            {},  # headers
+            {},  # params
+            request_body,  # body
+            None,  # request_guid
+            API_TIMEOUT,  # timeout in milliseconds
+        )
+        
+        # Content is a string with serialized JSON object
+        parsed_content = json.loads(resp["content"])
+
+        #append analyst_message to session_State                        
+        analyst_message = {
+            "role": "analyst",
+            "content": parsed_content["message"]["content"],
+            "request_id": parsed_content["request_id"],
+        }
+                    
+        st.session_state.messages.append(analyst_message)
+    
+        return (parsed_content)
+
+        
+
+def display_response(parsed_content):
+
+        # enumerated_session_state_messages = enumerate(st.session_state.messages)
+        response_index = len(st.session_state.messages)-1
+        # Show progress indicator inside analyst chat message while waiting for response
+        with st.chat_message("assistant"):
+            with st.spinner("Waiting for Analyst's response..."):
+                time.sleep(1)
+                if ("text" in parsed_content["message"]["content"][0]):
+                    st.markdown(parsed_content["message"]["content"][0]["text"])
+                
+                if ("statement" in parsed_content["message"]["content"][1]):
+                    query = parsed_content["message"]["content"][1]["statement"]
+                    st.markdown("You can run this SQL to get your analysis:")
+                    # Display the SQL query
+                    with st.expander("SQL Query", expanded=False):
+                        st.code(query,language = 'sql')
+                        
+                    df = session.sql(query).to_pandas()
+                    data_tab, chart_tab = st.tabs(["Data 📄", "Chart 📉"])
+                    with data_tab:
+                            st.dataframe(df, use_container_width=True)
+
+                    with chart_tab:
+                        chart_generator(df,response_index)
+                        
+
+                if ("suggestions" in parsed_content["message"]["content"][1]):
+                    st.markdown("Here are some suggested queries:")
+                    for suggestion in parsed_content["message"]["content"][1]["suggestions"]:
+                        st.code(suggestion,language = 'sql')
+
+
+
+
+
+st.title("ECOMM KPI Analyst")
+
+
+
+
+
+def chart_generator(df,index):
+        # There should be at least 2 columns to draw charts
+    message_index = index
+    
+    if len(df.columns) >= 2:
+        all_cols_set = set(df.columns)
+        col1, col2 = st.columns(2)
+        x_col = col1.selectbox(
+            "X axis", all_cols_set, 
+            key=f"x_col_select_{message_index}"
+        )
+        
+        y_col = col2.selectbox(
+            "Y axis",
+            all_cols_set.difference({x_col}),
+            key=f"y_col_select_{message_index}"
+        )
+        
+        
+        chart_type = st.selectbox(
+            "Select chart type",
+            options=["Line Chart 📈", "Bar Chart 📊"],
+            key=f"chart_type_{message_index}",
+        )
+        if chart_type == "Line Chart 📈":
+            st.line_chart(df.set_index(x_col)[y_col])
+        elif chart_type == "Bar Chart 📊":
+            st.bar_chart(df.set_index(x_col)[y_col])
+    else:
+        st.write("At least 2 columns are required")
+
+
+
+
+# Initialize a Snowpark session for executing queries
+session = get_active_session()
+
+#side bar contains clear chat history
+with st.sidebar:
+    if st.button("Clear Chat History", use_container_width=True):
+        del st.session_state["messages"]
+
+                
+
+#display conversation history
+
+conversation_history()
+
+
+#prompt element to get user input
+prompt = st.chat_input("Ask about the ecomm kpi table:")
+
+
+#if we receive a user prompt
+if (prompt):
+
+                
+        #we showcase the user message
+        user_message()
+
+        #send the entire session message to api
+        parsed_content = analyst_response(st.session_state.messages)
+
+        #display the response
+        display_response(parsed_content)
+
+
+st.write(session)
+
+
